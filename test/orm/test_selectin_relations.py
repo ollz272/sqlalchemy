@@ -2385,13 +2385,14 @@ class ChunkingTest(fixtures.DeclarativeMappedTest):
         session = fixture_session()
 
         def go():
-            with mock.patch(
-                "sqlalchemy.orm.strategies._SelectInLoader._chunksize", 47
-            ):
-                q = session.query(A).options(selectinload(A.bs)).order_by(A.id)
+            q = (
+                session.query(A)
+                .options(selectinload(A.bs, chunk_size=47))
+                .order_by(A.id)
+            )
 
-                for a in q:
-                    a.bs
+            for a in q:
+                a.bs
 
         self.assert_sql_execution(
             testing.db,
@@ -2457,13 +2458,14 @@ class ChunkingTest(fixtures.DeclarativeMappedTest):
         session = fixture_session()
 
         def go():
-            with mock.patch(
-                "sqlalchemy.orm.strategies._SelectInLoader._chunksize", 47
-            ):
-                q = session.query(B).options(selectinload(B.a)).order_by(B.id)
+            q = (
+                session.query(B)
+                .options(selectinload(B.a, chunk_size=47))
+                .order_by(B.id)
+            )
 
-                for b in q:
-                    b.a
+            for b in q:
+                b.a
 
         self.assert_sql_execution(
             testing.db,
@@ -2490,6 +2492,24 @@ class ChunkingTest(fixtures.DeclarativeMappedTest):
                 "(__[POSTCOMPILE_primary_keys])",
                 {"primary_keys": list(range(95, 101))},
             ),
+        )
+
+    def test_invalid_chunk_size(self):
+        A, B = self.classes("A", "B")
+
+        session = fixture_session()
+
+        q = (
+            session.query(A)
+            .options(selectinload(A.bs, chunk_size=0))
+            .order_by(A.id)
+        )
+
+        assert_raises_message(
+            sa.exc.ArgumentError,
+            "selectinload option chunk_size must be a positive integer",
+            list,
+            q,
         )
 
 
