@@ -359,6 +359,7 @@ class _AbstractLoad(traversals.GenerativeOnTraversal, LoaderOption):
         self,
         attr: _AttrType,
         recursion_depth: Optional[int] = None,
+        chunk_size: Optional[int] = None,
     ) -> Self:
         """Indicate that the given attribute should be loaded using
         SELECT IN eager loading.
@@ -385,6 +386,10 @@ class _AbstractLoad(traversals.GenerativeOnTraversal, LoaderOption):
          indicates "selectin" loading will continue that many levels deep
          automatically until no items are found.
 
+        :param chunk_size: optional int; when set, limits the number of
+         parent identities handled per emitted SELECT statement.  This value
+         overrides the default chunk size used by the loader.
+
          .. note:: The :paramref:`_orm.selectinload.recursion_depth` option
             currently supports only self-referential relationships.  There
             is not yet an option to automatically traverse recursive structures
@@ -405,10 +410,12 @@ class _AbstractLoad(traversals.GenerativeOnTraversal, LoaderOption):
             :ref:`selectin_eager_loading`
 
         """
+        opts = {"recursion_depth": recursion_depth, "chunk_size": chunk_size}
+
         return self._set_relationship_strategy(
             attr,
             {"lazy": "selectin"},
-            opts={"recursion_depth": recursion_depth},
+            opts=opts,
         )
 
     def lazyload(self, attr: _AttrType) -> Self:
@@ -2435,10 +2442,15 @@ def subqueryload(*keys: _AttrType) -> _AbstractLoad:
 
 @loader_unbound_fn
 def selectinload(
-    *keys: _AttrType, recursion_depth: Optional[int] = None
+    *keys: _AttrType,
+    recursion_depth: Optional[int] = None,
+    chunk_size: Optional[int] = None,
 ) -> _AbstractLoad:
     return _generate_from_keys(
-        Load.selectinload, keys, False, {"recursion_depth": recursion_depth}
+        Load.selectinload,
+        keys,
+        False,
+        {"recursion_depth": recursion_depth, "chunk_size": chunk_size},
     )
 
 

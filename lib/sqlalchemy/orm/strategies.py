@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import collections
 import itertools
+import operator
 from typing import Any
 from typing import Dict
 from typing import Literal
@@ -3148,6 +3149,25 @@ class _SelectInLoader(_PostLoader, util.MemoizedSlots):
 
         query_info = self._query_info
 
+        if loadopt:
+            chunk_size = loadopt.local_opts.get("chunk_size", None)
+        else:
+            chunk_size = None
+
+        if chunk_size is not None:
+            try:
+                chunk_size = operator.index(chunk_size)
+            except TypeError as err:
+                raise sa_exc.ArgumentError(
+                    "selectinload option chunk_size must be an integer"
+                ) from err
+            if chunk_size <= 0:
+                raise sa_exc.ArgumentError(
+                    "selectinload option chunk_size must be a positive integer"
+                )
+        else:
+            chunk_size = self._chunksize
+
         if query_info.load_only_child:
             our_states = collections.defaultdict(list)
             none_states = []
@@ -3337,10 +3357,16 @@ class _SelectInLoader(_PostLoader, util.MemoizedSlots):
                 q,
                 context,
                 execution_options,
+                chunk_size,
             )
         else:
             self._load_via_parent(
-                our_states, query_info, q, context, execution_options
+                our_states,
+                query_info,
+                q,
+                context,
+                execution_options,
+                chunk_size,
             )
 
     def _load_via_child(
@@ -3351,14 +3377,15 @@ class _SelectInLoader(_PostLoader, util.MemoizedSlots):
         q,
         context,
         execution_options,
+        chunk_size,
     ):
         uselist = self.uselist
 
         # this sort is really for the benefit of the unit tests
         our_keys = sorted(our_states)
         while our_keys:
-            chunk = our_keys[0 : self._chunksize]
-            our_keys = our_keys[self._chunksize :]
+            chunk = our_keys[0:chunk_size]
+            our_keys = our_keys[chunk_size:]
             data = {
                 k: v
                 for k, v in context.session.execute(
@@ -3399,14 +3426,20 @@ class _SelectInLoader(_PostLoader, util.MemoizedSlots):
             state.get_impl(self.key).set_committed_value(state, dict_, None)
 
     def _load_via_parent(
-        self, our_states, query_info, q, context, execution_options
+        self,
+        our_states,
+        query_info,
+        q,
+        context,
+        execution_options,
+        chunk_size,
     ):
         uselist = self.uselist
         _empty_result = () if uselist else None
 
         while our_states:
-            chunk = our_states[0 : self._chunksize]
-            our_states = our_states[self._chunksize :]
+            chunk = our_states[0:chunk_size]
+            our_states = our_states[chunk_size:]
 
             primary_keys = [
                 key[0] if query_info.zero_idx else key
