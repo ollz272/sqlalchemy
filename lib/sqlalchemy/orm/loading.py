@@ -967,6 +967,11 @@ def _instance_processor(
             context, query_entity, path, mapper, result, adapter, populators
         )
 
+    pop_quick = populators["quick"]
+    pop_expire = populators["expire"]
+    pop_new = populators["new"]
+    pop_existing = populators["existing"]
+
     propagated_loader_options = context.propagated_loader_options
     load_path = (
         context.compile_state.current_path + path
@@ -1150,17 +1155,52 @@ def _instance_processor(
                 state.load_options = propagated_loader_options
                 state.load_path = load_path
 
-            _populate_full(
-                context,
-                row,
-                state,
-                dict_,
-                isnew,
-                load_path,
-                loaded_instance,
-                effective_populate_existing,
-                populators,
-            )
+            # population routines, inlined here as this is the hot path
+            # for all instance loads
+            if isnew:
+                # first time we are seeing a row with this identity.
+                state.runid = runid
+
+                for key, getter in pop_quick:
+                    dict_[key] = getter(row)
+                if effective_populate_existing:
+                    for key, set_callable in pop_expire:
+                        dict_.pop(key, None)
+                        if set_callable:
+                            state.expired_attributes.add(key)
+                else:
+                    for key, set_callable in pop_expire:
+                        if set_callable:
+                            state.expired_attributes.add(key)
+
+                for key, populator in pop_new:
+                    populator(state, dict_, row)
+
+            elif load_path != state.load_path:
+                # new load path, e.g. object is present in more than one
+                # column position in a series of rows
+                state.load_path = load_path
+
+                # if we have data, and the data isn't in the dict, OK, let's
+                # put it in.
+                for key, getter in pop_quick:
+                    if key not in dict_:
+                        dict_[key] = getter(row)
+
+                # otherwise treat like an "already seen" row
+                for key, populator in pop_existing:
+                    populator(state, dict_, row)
+                    # TODO:  allow "existing" populator to know this is
+                    # a new path for the state:
+                    # populator(state, dict_, row, new_path=True)
+
+            else:
+                # have already seen rows with this identity in this same path.
+                for key, populator in pop_existing:
+                    populator(state, dict_, row)
+
+                    # TODO: same path
+                    # populator(state, dict_, row, new_path=False)
 
             if isnew:
                 # state.runid should be equal to context.runid / runid
@@ -1331,63 +1371,6 @@ def _load_subclass_via_in(
             ).unique().scalars().all()
 
     return do_load
-
-
-def _populate_full(
-    context,
-    row,
-    state,
-    dict_,
-    isnew,
-    load_path,
-    loaded_instance,
-    populate_existing,
-    populators,
-):
-    if isnew:
-        # first time we are seeing a row with this identity.
-        state.runid = context.runid
-
-        for key, getter in populators["quick"]:
-            dict_[key] = getter(row)
-        if populate_existing:
-            for key, set_callable in populators["expire"]:
-                dict_.pop(key, None)
-                if set_callable:
-                    state.expired_attributes.add(key)
-        else:
-            for key, set_callable in populators["expire"]:
-                if set_callable:
-                    state.expired_attributes.add(key)
-
-        for key, populator in populators["new"]:
-            populator(state, dict_, row)
-
-    elif load_path != state.load_path:
-        # new load path, e.g. object is present in more than one
-        # column position in a series of rows
-        state.load_path = load_path
-
-        # if we have data, and the data isn't in the dict, OK, let's put
-        # it in.
-        for key, getter in populators["quick"]:
-            if key not in dict_:
-                dict_[key] = getter(row)
-
-        # otherwise treat like an "already seen" row
-        for key, populator in populators["existing"]:
-            populator(state, dict_, row)
-            # TODO:  allow "existing" populator to know this is
-            # a new path for the state:
-            # populator(state, dict_, row, new_path=True)
-
-    else:
-        # have already seen rows with this identity in this same path.
-        for key, populator in populators["existing"]:
-            populator(state, dict_, row)
-
-            # TODO: same path
-            # populator(state, dict_, row, new_path=False)
 
 
 def _populate_partial(
