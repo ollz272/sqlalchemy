@@ -534,9 +534,16 @@ class CollectionAdapter:
         """Add or restore an entity to the collection, firing no events."""
         if self.empty:
             self._refuse_empty()
-        appender = self._data()._sa_appender
-        for item in items:
-            appender(item, _sa_initiator=False)
+        data = self._data()
+        if type(data) is InstrumentedList:
+            # fast path for the default list-based collection; with
+            # events disabled the instrumented append reduces to
+            # list.append
+            list.extend(data, items)
+        else:
+            appender = data._sa_appender
+            for item in items:
+                appender(item, _sa_initiator=False)
 
     def bulk_remover(self):
         return self._data()._sa_remover
