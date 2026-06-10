@@ -31,6 +31,7 @@ from . import query
 from . import relationships
 from . import unitofwork
 from . import util as orm_util
+from ._loading_cy import _group_pairs
 from .base import _DEFER_FOR_STATE
 from .base import _RAISE_FOR_STATE
 from .base import _SET_DEFERRED_EXPIRED
@@ -3508,9 +3509,7 @@ class _SelectInLoader(_PostLoader, util.MemoizedSlots):
                 params={"primary_keys": primary_keys},
                 execution_options=execution_options,
             )
-            data = collections.defaultdict(list)
-            for k, v in self._iterate_result(result):
-                data[k].append(v)
+            data = _group_pairs(self._iterate_result(result))
 
             for lookup_key, (key, state, state_dict, overwrite) in zip(
                 primary_keys, chunk
