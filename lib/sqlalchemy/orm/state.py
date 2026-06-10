@@ -207,8 +207,19 @@ class InstanceState(interfaces.InspectionAttrInfo, Generic[_O]):
         self.class_ = obj.__class__
         self.manager = manager
         self.obj = weakref.ref(obj, self._cleanup)
-        self.committed_state = {}
-        self.expired_attributes = set()
+
+    def __getattr__(self, key: str) -> Any:
+        # lazy creation of the mutation-tracking containers, which avoids
+        # building them for freshly loaded instances that are never
+        # subsequently mutated
+        ret: Any
+        if key == "committed_state":
+            self.committed_state = ret = {}
+        elif key == "expired_attributes":
+            self.expired_attributes = ret = set()
+        else:
+            raise AttributeError(key)
+        return ret
 
     @util.memoized_property
     def attrs(self) -> util.ReadOnlyProperties[AttributeState]:
