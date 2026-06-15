@@ -13,6 +13,7 @@ implementations, and related MapperOptions."""
 from __future__ import annotations
 
 import collections
+import itertools
 from typing import Any
 from typing import Dict
 from typing import Literal
@@ -31,7 +32,6 @@ from . import query
 from . import relationships
 from . import unitofwork
 from . import util as orm_util
-from ._loading_cy import _group_pairs
 from .base import _DEFER_FOR_STATE
 from .base import _RAISE_FOR_STATE
 from .base import _SET_DEFERRED_EXPIRED
@@ -3462,7 +3462,13 @@ class _SelectInLoader(_PostLoader, util.MemoizedSlots):
                 params={"primary_keys": primary_keys},
                 execution_options=execution_options,
             )
-            data = dict(self._iterate_result(result))
+            if result.context is not None and result.context.requires_uniquing:
+                rows = result.unique()
+            else:
+                # consume the result as plain tuples, skipping per-row
+                # Row construction
+                rows = result._raw_all_tuples()
+            data = {k: v for k, v in rows}
 
             for lookup_key, key in zip(primary_keys, chunk):
                 # for a real foreign key and no concurrent changes to the
@@ -3509,7 +3515,16 @@ class _SelectInLoader(_PostLoader, util.MemoizedSlots):
                 params={"primary_keys": primary_keys},
                 execution_options=execution_options,
             )
-            data = _group_pairs(self._iterate_result(result))
+
+            if result.context is not None and result.context.requires_uniquing:
+                rows = result.unique()
+            else:
+                # consume the result as plain tuples, skipping per-row
+                # Row construction
+                rows = result._raw_all_tuples()
+            data = collections.defaultdict(list)
+            for k, v in itertools.groupby(rows, lambda x: x[0]):
+                data[k].extend(vv[1] for vv in v)
 
             for lookup_key, (key, state, state_dict, overwrite) in zip(
                 primary_keys, chunk
