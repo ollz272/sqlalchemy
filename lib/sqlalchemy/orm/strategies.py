@@ -3410,6 +3410,7 @@ class _SelectInLoader(_PostLoader, util.MemoizedSlots):
         chunksize,
     ):
         uselist = self.uselist
+        self_key = self.key
 
         # this sort is really for the benefit of the unit tests
         our_keys = sorted(our_states)
@@ -3441,28 +3442,29 @@ class _SelectInLoader(_PostLoader, util.MemoizedSlots):
                 # related object.
                 related_obj = data.get(key, None)
                 for state, dict_, overwrite in our_states[key]:
-                    if not overwrite and self.key in dict_:
+                    if not overwrite and self_key in dict_:
                         continue
 
-                    state.get_impl(self.key).set_committed_value(
+                    state.get_impl(self_key).set_committed_value(
                         state,
                         dict_,
                         related_obj if not uselist else [related_obj],
                     )
         # populate none states with empty value / collection
         for state, dict_, overwrite in none_states:
-            if not overwrite and self.key in dict_:
+            if not overwrite and self_key in dict_:
                 continue
 
             # note it's OK if this is a uselist=True attribute, the empty
             # collection will be populated
-            state.get_impl(self.key).set_committed_value(state, dict_, None)
+            state.get_impl(self_key).set_committed_value(state, dict_, None)
 
     def _load_via_parent(
         self, our_states, query_info, q, context, execution_options, chunksize
     ):
         uselist = self.uselist
         _empty_result = () if uselist else None
+        self_key = self.key
 
         while our_states:
             chunk = our_states[0:chunksize]
@@ -3485,11 +3487,11 @@ class _SelectInLoader(_PostLoader, util.MemoizedSlots):
                 # Row construction
                 rows = result._raw_all_tuples()
             data = collections.defaultdict(list)
-            for k, v in itertools.groupby(rows, lambda x: x[0]):
-                data[k].extend(vv[1] for vv in v)
+            for row in rows:
+                data[row[0]].append(row[1])
 
             for key, state, state_dict, overwrite in chunk:
-                if not overwrite and self.key in state_dict:
+                if not overwrite and self_key in state_dict:
                     continue
 
                 collection = data.get(key, _empty_result)
@@ -3501,13 +3503,13 @@ class _SelectInLoader(_PostLoader, util.MemoizedSlots):
                             "uselist=False for eagerly-loaded "
                             "attribute '%s' " % self
                         )
-                    state.get_impl(self.key).set_committed_value(
+                    state.get_impl(self_key).set_committed_value(
                         state, state_dict, collection[0]
                     )
                 else:
                     # note that empty tuple set on uselist=False sets the
                     # value to None
-                    state.get_impl(self.key).set_committed_value(
+                    state.get_impl(self_key).set_committed_value(
                         state, state_dict, collection
                     )
 
