@@ -974,14 +974,15 @@ class InstanceState(interfaces.InspectionAttrInfo, Generic[_O]):
         this step if a value was not populated in state.dict.
 
         """
+        committed_state = self.committed_state
         for key in keys:
-            self.committed_state.pop(key, None)
+            committed_state.pop(key, None)
 
         self.expired = False
 
-        self.expired_attributes.difference_update(
-            set(keys).intersection(dict_)
-        )
+        exp = self.expired_attributes
+        if exp:
+            exp.difference_update([k for k in keys if k in dict_])
 
         # the per-keys commit removes object-level callables,
         # while that of commit_all does not.  it's not clear
@@ -1026,12 +1027,15 @@ class InstanceState(interfaces.InspectionAttrInfo, Generic[_O]):
         for state, dict_ in iter_:
             state_dict = state.__dict__
 
-            state.committed_state.clear()
+            if state.committed_state:
+                state.committed_state.clear()
 
             if "_pending_mutations" in state_dict:
                 del state_dict["_pending_mutations"]
 
-            state.expired_attributes.difference_update(dict_)
+            exp = state.expired_attributes
+            if exp:
+                exp.difference_update(dict_)
 
             if instance_dict and state.modified:
                 instance_dict._modified.discard(state)

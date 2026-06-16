@@ -13,7 +13,6 @@ implementations, and related MapperOptions."""
 from __future__ import annotations
 
 import collections
-import itertools
 from typing import Any
 from typing import Dict
 from typing import Literal
@@ -1818,7 +1817,7 @@ class _SubqueryLoader(_PostLoader):
             return self._data.get(key, default)
 
         def _load(self):
-            self._data = collections.defaultdict(list)
+            self._data = data = collections.defaultdict(list)
 
             q = self.subq
             assert q.session is None
@@ -1829,10 +1828,40 @@ class _SubqueryLoader(_PostLoader):
                 q = q.populate_existing()
             # to work with baked query, the parameters may have been
             # updated since this query was created, so take these into account
+            q = q.params(self.params)
 
-            rows = list(q.params(self.params))
-            for k, v in itertools.groupby(rows, lambda x: x[1:]):
-                self._data[k].extend(vv[0] for vv in v)
+            # execute the statement directly rather than iterating the Query,
+            # which would route through Query.__iter__ -> result.unique() and
+            # build a Row object per row.  the subquery entity result does not
+            # actually require uniquing in the common case, so consume the
+            # raw tuples and group on a plain tuple slice.
+            result = self.session.execute(
+                q._statement_20(),
+                q._params,
+                execution_options={"_sa_orm_load_options": q.load_options},
+            )
+
+            if result.context is not None and result.context.requires_uniquing:
+                # e.g. a joinedload nested inside the subqueryload requires
+                # de-duplicating the rows; keep the Row-based unique() path
+                for row in result.unique():
+                    tup = row._to_tuple_instance()
+                    data[tup[1:]].append(tup[0])
+            else:
+                # legacy Query iteration always applied result.unique();
+                # replicate that dedup on the plain processed tuples so we
+                # avoid building a Row per row.  the related object (tup[0])
+                # is keyed on identity, matching the ORM uniquing filter
+                # (use_id_for_hash), while the remaining key columns are
+                # scalar values compared by value.
+                seen: set = set()
+                seen_add = seen.add
+                for tup in result._raw_all_tuples():
+                    unique_key = (id(tup[0]),) + tup[1:]
+                    if unique_key in seen:
+                        continue
+                    seen_add(unique_key)
+                    data[tup[1:]].append(tup[0])
 
         def loader(self, state, dict_, row):
             if self._data is None:
@@ -3192,17 +3221,33 @@ class _SelectInLoader(_PostLoader, util.MemoizedSlots):
 
             mapper = self.parent
 
+            # attribute keys for the lookup columns; when these are
+            # present in a state's dict, reading them directly is
+            # equivalent to the PASSIVE_NO_FETCH attribute lookup below.
+            # whether or not a key is present can vary per state, e.g.
+            # individual instances may have the attribute expired or
+            # deferred, so this is determined state-by-state
+            lookup_keys = [
+                mapper._columntoproperty[lk].key
+                for lk in query_info.child_lookup_cols
+            ]
+            missing = object()
+
             for state, overwrite in states:
                 state_dict = state.dict
                 related_ident = tuple(
-                    mapper._get_state_attr_by_column(
-                        state,
-                        state_dict,
-                        lk,
-                        passive=attributes.PASSIVE_NO_FETCH,
-                    )
-                    for lk in query_info.child_lookup_cols
+                    [state_dict.get(lk, missing) for lk in lookup_keys]
                 )
+                if missing in related_ident:
+                    related_ident = tuple(
+                        mapper._get_state_attr_by_column(
+                            state,
+                            state_dict,
+                            lk,
+                            passive=attributes.PASSIVE_NO_FETCH,
+                        )
+                        for lk in query_info.child_lookup_cols
+                    )
                 # if the loaded parent objects do not have the foreign key
                 # to the related item loaded, then degrade into the joined
                 # version of selectinload
@@ -3244,12 +3289,18 @@ class _SelectInLoader(_PostLoader, util.MemoizedSlots):
                 ]
                 in_expr = effective_entity._adapt_element(in_expr)
 
-        bundle_ent = orm_util.Bundle("pk", *pk_cols)
-        bundle_sql = bundle_ent.__clause_element__()
+        if query_info.zero_idx:
+            # single column key; select the column directly so that
+            # result rows carry the plain key value rather than a
+            # per-row Bundle Row object
+            pk_sql = pk_cols[0]
+        else:
+            bundle_ent = orm_util.Bundle("pk", *pk_cols)
+            pk_sql = bundle_ent.__clause_element__()
 
         entity_sql = effective_entity.__clause_element__()
         q = Select._create_raw_select(
-            _raw_columns=[bundle_sql, entity_sql],
+            _raw_columns=[pk_sql, entity_sql],
             _compile_options=_ORMCompileState.default_compile_options,
             _propagate_attrs={
                 "compile_state_plugin": "orm",
@@ -3410,19 +3461,19 @@ class _SelectInLoader(_PostLoader, util.MemoizedSlots):
         chunksize,
     ):
         uselist = self.uselist
+        self_key = self.key
 
         # this sort is really for the benefit of the unit tests
         our_keys = sorted(our_states)
         while our_keys:
             chunk = our_keys[0:chunksize]
             our_keys = our_keys[chunksize:]
+            primary_keys = [
+                key[0] if query_info.zero_idx else key for key in chunk
+            ]
             result = context.session.execute(
                 q,
-                params={
-                    "primary_keys": [
-                        key[0] if query_info.zero_idx else key for key in chunk
-                    ]
-                },
+                params={"primary_keys": primary_keys},
                 execution_options=execution_options,
             )
             if result.context is not None and result.context.requires_uniquing:
@@ -3433,36 +3484,37 @@ class _SelectInLoader(_PostLoader, util.MemoizedSlots):
                 rows = result._raw_all_tuples()
             data = {k: v for k, v in rows}
 
-            for key in chunk:
+            for lookup_key, key in zip(primary_keys, chunk):
                 # for a real foreign key and no concurrent changes to the
                 # DB while running this method, "key" is always present in
                 # data.  However, for primaryjoins without real foreign keys
                 # a non-None primaryjoin condition may still refer to no
                 # related object.
-                related_obj = data.get(key, None)
+                related_obj = data.get(lookup_key, None)
                 for state, dict_, overwrite in our_states[key]:
-                    if not overwrite and self.key in dict_:
+                    if not overwrite and self_key in dict_:
                         continue
 
-                    state.get_impl(self.key).set_committed_value(
+                    state.get_impl(self_key).set_committed_value(
                         state,
                         dict_,
                         related_obj if not uselist else [related_obj],
                     )
         # populate none states with empty value / collection
         for state, dict_, overwrite in none_states:
-            if not overwrite and self.key in dict_:
+            if not overwrite and self_key in dict_:
                 continue
 
             # note it's OK if this is a uselist=True attribute, the empty
             # collection will be populated
-            state.get_impl(self.key).set_committed_value(state, dict_, None)
+            state.get_impl(self_key).set_committed_value(state, dict_, None)
 
     def _load_via_parent(
         self, our_states, query_info, q, context, execution_options, chunksize
     ):
         uselist = self.uselist
         _empty_result = () if uselist else None
+        self_key = self.key
 
         while our_states:
             chunk = our_states[0:chunksize]
@@ -3485,14 +3537,16 @@ class _SelectInLoader(_PostLoader, util.MemoizedSlots):
                 # Row construction
                 rows = result._raw_all_tuples()
             data = collections.defaultdict(list)
-            for k, v in itertools.groupby(rows, lambda x: x[0]):
-                data[k].extend(vv[1] for vv in v)
+            for row in rows:
+                data[row[0]].append(row[1])
 
-            for key, state, state_dict, overwrite in chunk:
-                if not overwrite and self.key in state_dict:
+            for lookup_key, (key, state, state_dict, overwrite) in zip(
+                primary_keys, chunk
+            ):
+                if not overwrite and self_key in state_dict:
                     continue
 
-                collection = data.get(key, _empty_result)
+                collection = data.get(lookup_key, _empty_result)
 
                 if not uselist and collection:
                     if len(collection) > 1:
@@ -3501,13 +3555,13 @@ class _SelectInLoader(_PostLoader, util.MemoizedSlots):
                             "uselist=False for eagerly-loaded "
                             "attribute '%s' " % self
                         )
-                    state.get_impl(self.key).set_committed_value(
+                    state.get_impl(self_key).set_committed_value(
                         state, state_dict, collection[0]
                     )
                 else:
                     # note that empty tuple set on uselist=False sets the
                     # value to None
-                    state.get_impl(self.key).set_committed_value(
+                    state.get_impl(self_key).set_committed_value(
                         state, state_dict, collection
                     )
 
