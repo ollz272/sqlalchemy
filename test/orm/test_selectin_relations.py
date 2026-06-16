@@ -4654,3 +4654,591 @@ class TestCompositePlusNonComposite(fixtures.DeclarativeMappedTest):
 
         eq_(a2.bs, [B2()])
         eq_(a1.bs, [B()])
+
+
+class GroupingResultTest(
+    fixtures.DeclarativeMappedTest, testing.AssertsExecutionResults
+):
+    """Coverage for the selectin result grouping in
+    ``_SelectInLoader._load_via_parent`` / ``_load_via_child``.
+
+    Exercises that the plain dict-of-lists append loop assigns each related
+    row to the correct parent (including when the rows come back NOT
+    contiguous by foreign key), across chunk boundaries, for uselist and
+    scalar collections, empty collections, many-to-many, polymorphic
+    hierarchies, and the many-to-one ``none_states`` path.
+
+    """
+
+    @classmethod
+    def setup_classes(cls):
+        Base = cls.DeclarativeBasic
+
+        # o2m, with child ordered by a NON-FK attribute so that rows
+        # interleave across parents (the non-contiguous grouping case)
+        class Parent(ComparableEntity, Base):
+            __tablename__ = "parent"
+            id = Column(Integer, primary_key=True)
+            data = Column(String(50))
+            # order by the child's "sort_key" rather than the FK so that
+            # the selectin subquery returns rows for different parents
+            # interleaved with each other.
+            children = relationship(
+                "Child",
+                order_by="Child.sort_key",
+                back_populates="parent",
+            )
+            # uselist=False (one-to-one) over the same child table
+            only_child = relationship(
+                "Child",
+                viewonly=True,
+                uselist=False,
+                order_by="Child.sort_key",
+            )
+
+        class Child(ComparableEntity, Base):
+            __tablename__ = "child"
+            id = Column(Integer, primary_key=True)
+            parent_id = Column(ForeignKey("parent.id"))
+            sort_key = Column(Integer)
+            data = Column(String(50))
+            parent = relationship("Parent", back_populates="children")
+
+        # many-to-many
+        secondary = Table(
+            "p2t",
+            Base.metadata,
+            Column("pid", ForeignKey("m2m_parent.id"), primary_key=True),
+            Column("tid", ForeignKey("tag.id"), primary_key=True),
+        )
+
+        class M2MParent(ComparableEntity, Base):
+            __tablename__ = "m2m_parent"
+            id = Column(Integer, primary_key=True)
+            data = Column(String(50))
+            tags = relationship(
+                "Tag", secondary=secondary, order_by="Tag.sort_key"
+            )
+
+        class Tag(ComparableEntity, Base):
+            __tablename__ = "tag"
+            id = Column(Integer, primary_key=True)
+            sort_key = Column(Integer)
+            name = Column(String(50))
+
+        # many-to-one (exercises _load_via_child + none_states)
+        class Item(ComparableEntity, Base):
+            __tablename__ = "item"
+            id = Column(Integer, primary_key=True)
+            owner_id = Column(ForeignKey("owner.id"), nullable=True)
+            owner = relationship("Owner")
+
+        class Owner(ComparableEntity, Base):
+            __tablename__ = "owner"
+            id = Column(Integer, primary_key=True)
+            name = Column(String(50))
+
+        # polymorphic hierarchy w/ selectin relationship; used to verify
+        # the per-state ``state.get_impl(self_key)`` resolution still works
+        # after hoisting ``self.key`` to a local.
+        class Employee(ComparableEntity, Base):
+            __tablename__ = "employee"
+            id = Column(Integer, primary_key=True)
+            type = Column(String(50))
+            name = Column(String(50))
+            __mapper_args__ = {
+                "polymorphic_on": type,
+                "polymorphic_identity": "employee",
+                "with_polymorphic": "*",
+            }
+
+        class Engineer(Employee):
+            __tablename__ = "engineer"
+            id = Column(ForeignKey("employee.id"), primary_key=True)
+            machines = relationship("Machine", order_by="Machine.sort_key")
+            __mapper_args__ = {"polymorphic_identity": "engineer"}
+
+        class Manager(Employee):
+            __tablename__ = "manager"
+            id = Column(ForeignKey("employee.id"), primary_key=True)
+            reports = relationship("Report", order_by="Report.sort_key")
+            __mapper_args__ = {"polymorphic_identity": "manager"}
+
+        class Machine(ComparableEntity, Base):
+            __tablename__ = "machine"
+            id = Column(Integer, primary_key=True)
+            engineer_id = Column(ForeignKey("engineer.id"))
+            sort_key = Column(Integer)
+            name = Column(String(50))
+
+        class Report(ComparableEntity, Base):
+            __tablename__ = "report"
+            id = Column(Integer, primary_key=True)
+            manager_id = Column(ForeignKey("manager.id"))
+            sort_key = Column(Integer)
+            name = Column(String(50))
+
+    @classmethod
+    def insert_data(cls, connection):
+        (
+            Parent,
+            Child,
+            M2MParent,
+            Tag,
+            Item,
+            Owner,
+            Engineer,
+            Manager,
+            Machine,
+            Report,
+        ) = cls.classes(
+            "Parent",
+            "Child",
+            "M2MParent",
+            "Tag",
+            "Item",
+            "Owner",
+            "Engineer",
+            "Manager",
+            "Machine",
+            "Report",
+        )
+
+        s = Session(connection)
+
+        # Parents 1, 2, 3.  Child ids are assigned so that ordering by the
+        # FK (parent_id) is the OPPOSITE of ordering by sort_key.  When the
+        # selectin subquery orders by sort_key, the rows interleave across
+        # parents, e.g. (p3, p2, p1, p3, p2, p1, ...).  Parent 2 has an
+        # empty collection.
+        s.add_all(
+            [
+                Parent(
+                    id=1,
+                    data="p1",
+                    children=[
+                        Child(id=11, sort_key=100, data="c11"),
+                        Child(id=12, sort_key=200, data="c12"),
+                        Child(id=13, sort_key=300, data="c13"),
+                    ],
+                ),
+                Parent(id=2, data="p2", children=[]),
+                Parent(
+                    id=3,
+                    data="p3",
+                    children=[
+                        Child(id=31, sort_key=10, data="c31"),
+                        Child(id=32, sort_key=20, data="c32"),
+                        Child(id=33, sort_key=30, data="c33"),
+                    ],
+                ),
+                # parent 4 has exactly one child -> clean uselist=False case
+                Parent(
+                    id=4,
+                    data="p4",
+                    children=[Child(id=41, sort_key=5, data="c41")],
+                ),
+            ]
+        )
+
+        # many-to-many: tags shared across parents, ordered by sort_key.
+        t1 = Tag(id=1, sort_key=50, name="t1")
+        t2 = Tag(id=2, sort_key=40, name="t2")
+        t3 = Tag(id=3, sort_key=30, name="t3")
+        t4 = Tag(id=4, sort_key=20, name="t4")
+        s.add_all(
+            [
+                M2MParent(id=1, data="m1", tags=[t1, t3]),
+                M2MParent(id=2, data="m2", tags=[]),
+                M2MParent(id=3, data="m3", tags=[t2, t4]),
+            ]
+        )
+
+        # many-to-one: item 1,2 -> owner 1; item 3 -> owner 2; item 4 -> None
+        o1 = Owner(id=1, name="o1")
+        o2 = Owner(id=2, name="o2")
+        s.add_all(
+            [
+                Item(id=1, owner=o1),
+                Item(id=2, owner=o1),
+                Item(id=3, owner=o2),
+                Item(id=4, owner=None),
+            ]
+        )
+
+        # polymorphic: an Engineer and a Manager, each with children
+        s.add_all(
+            [
+                Engineer(
+                    id=1,
+                    name="e1",
+                    machines=[
+                        Machine(id=1, sort_key=2, name="m_a"),
+                        Machine(id=2, sort_key=1, name="m_b"),
+                    ],
+                ),
+                Manager(
+                    id=2,
+                    name="mgr1",
+                    reports=[
+                        Report(id=1, sort_key=2, name="r_a"),
+                        Report(id=2, sort_key=1, name="r_b"),
+                    ],
+                ),
+            ]
+        )
+
+        s.commit()
+
+    def test_basic_o2m_ordering(self):
+        """Every parent gets exactly its children, order preserved."""
+        Parent, Child = self.classes("Parent", "Child")
+        sess = fixture_session()
+
+        def go():
+            result = (
+                sess.query(Parent)
+                .options(selectinload(Parent.children))
+                .order_by(Parent.id)
+                .all()
+            )
+            eq_(
+                result,
+                [
+                    Parent(
+                        id=1,
+                        children=[
+                            Child(id=11),
+                            Child(id=12),
+                            Child(id=13),
+                        ],
+                    ),
+                    Parent(id=2, children=[]),
+                    Parent(
+                        id=3,
+                        children=[
+                            Child(id=31),
+                            Child(id=32),
+                            Child(id=33),
+                        ],
+                    ),
+                    Parent(id=4, children=[Child(id=41)]),
+                ],
+            )
+            # exact per-collection order (relationship order_by sort_key)
+            eq_([c.id for c in result[0].children], [11, 12, 13])
+            eq_([c.id for c in result[2].children], [31, 32, 33])
+
+        self.assert_sql_count(testing.db, go, 2)
+
+    def test_noncontiguous_grouping(self):
+        """The crux: the selectin rows come back ordered by the child's
+        ``sort_key`` so that rows for different parents are interleaved
+        rather than contiguous by FK.  The plain append loop must still
+        assign each child to the correct parent.
+
+        This guards the grouping against any contiguity assumption.  (Note
+        the immediately-prior implementation, ``itertools.groupby`` feeding
+        ``data[k].extend(...)`` into a defaultdict, was *also* order
+        insensitive; but an ``itertools.groupby`` form that *assigned*
+        ``data[k] = [...]`` would silently drop all but the last block for
+        an interleaved key.  This test fails against that class of bug.)
+
+        """
+        Parent, Child = self.classes("Parent", "Child")
+        sess = fixture_session()
+
+        # Confirm the selectin rows really are non-contiguous by parent_id:
+        # ordering child by sort_key (as the relationship does) yields
+        # parent_ids 4,3,3,3,1,1,1 — i.e. NOT ascending FK order.  The fully
+        # interleaved (alternating) case is covered separately below.
+        raw = sess.execute(
+            select(Child.parent_id).order_by(Child.sort_key)
+        ).all()
+        eq_([r[0] for r in raw], [4, 3, 3, 3, 1, 1, 1])
+
+        def go():
+            result = (
+                sess.query(Parent)
+                .options(selectinload(Parent.children))
+                .order_by(Parent.id)
+                .all()
+            )
+            # despite interleaved row order, grouping is correct
+            eq_(
+                {p.id: sorted(c.id for c in p.children) for p in result},
+                {1: [11, 12, 13], 2: [], 3: [31, 32, 33], 4: [41]},
+            )
+
+        self.assert_sql_count(testing.db, go, 2)
+
+    def test_noncontiguous_grouping_forced_interleave(self):
+        """Force a truly interleaved row order (alternating parents) and
+        assert correct grouping.  This is the strongest guard that grouping
+        does not depend on rows being contiguous by key.
+
+        """
+        Parent, Child = self.classes("Parent", "Child")
+        sess = fixture_session()
+
+        # Reassign sort_keys so that ordering by sort_key alternates
+        # between parents: child 31 -> 1, 11 -> 2, 32 -> 3, 12 -> 4, etc.
+        # giving parent_id order 3,1,3,1,3,1 (fully interleaved), with
+        # parent 4's single child trailing.
+        mapping = {31: 1, 11: 2, 32: 3, 12: 4, 33: 5, 13: 6, 41: 7}
+        for cid, sk in mapping.items():
+            sess.get(Child, cid).sort_key = sk
+        sess.commit()
+        sess.expunge_all()
+
+        raw = sess.execute(
+            select(Child.parent_id).order_by(Child.sort_key)
+        ).all()
+        eq_([r[0] for r in raw], [3, 1, 3, 1, 3, 1, 4])
+
+        def go():
+            result = (
+                sess.query(Parent)
+                .options(selectinload(Parent.children))
+                .order_by(Parent.id)
+                .all()
+            )
+            by_id = {p.id: [c.id for c in p.children] for p in result}
+            # relationship order_by Child.sort_key applies to the loaded
+            # collection too
+            eq_(by_id[1], [11, 12, 13])
+            eq_(by_id[3], [31, 32, 33])
+            eq_(by_id[2], [])
+            eq_(by_id[4], [41])
+
+        self.assert_sql_count(testing.db, go, 2)
+
+    def test_chunk_boundary(self):
+        """Load > _chunksize (500) parents so grouping spans multiple
+        chunks; assert every collection correct across the boundary.
+
+        """
+        Parent, Child = self.classes("Parent", "Child")
+        sess = fixture_session()
+
+        # 600 fresh parents, each with 2 children, ids well above the
+        # fixture rows.  Child sort_key is set so loaded order interleaves.
+        n = 600
+        parents = []
+        for i in range(1000, 1000 + n):
+            parents.append(
+                Parent(
+                    id=i,
+                    data="bulk%d" % i,
+                    children=[
+                        Child(
+                            id=i * 10 + 1,
+                            sort_key=(n - (i - 1000)),
+                            data="a",
+                        ),
+                        Child(
+                            id=i * 10 + 2,
+                            sort_key=(n - (i - 1000)) + 1000,
+                            data="b",
+                        ),
+                    ],
+                )
+            )
+        sess.add_all(parents)
+        sess.commit()
+        sess.expunge_all()
+
+        ids = list(range(1000, 1000 + n))
+
+        def go():
+            result = (
+                sess.query(Parent)
+                .filter(Parent.id.in_(ids))
+                .options(selectinload(Parent.children))
+                .order_by(Parent.id)
+                .all()
+            )
+            eq_(len(result), n)
+            for p in result:
+                eq_(
+                    sorted(c.id for c in p.children),
+                    [p.id * 10 + 1, p.id * 10 + 2],
+                )
+
+        # 1 for parents + 2 selectin chunks (500 + 100) = 3
+        self.assert_sql_count(testing.db, go, 3)
+
+    def test_uselist_false_scalar(self):
+        """uselist=False (one-to-one) via selectin: scalar populated."""
+        Parent, Child = self.classes("Parent", "Child")
+        sess = fixture_session()
+
+        def go():
+            p = (
+                sess.query(Parent)
+                .filter(Parent.id == 4)
+                .options(selectinload(Parent.only_child))
+                .one()
+            )
+            # parent 4 has exactly one child (id 41)
+            eq_(p.only_child, Child(id=41))
+
+        self.assert_sql_count(testing.db, go, 2)
+
+    def test_uselist_false_empty(self):
+        """uselist=False where the parent has no children -> None."""
+        Parent = self.classes.Parent
+        sess = fixture_session()
+
+        p = (
+            sess.query(Parent)
+            .filter(Parent.id == 2)
+            .options(selectinload(Parent.only_child))
+            .one()
+        )
+        is_(p.only_child, None)
+
+    def test_uselist_false_multiple_rows_warning(self):
+        """uselist=False where a key maps to >1 row warns, and the warning
+        path still assigns ``collection[0]``.
+
+        """
+        Parent, Child = self.classes("Parent", "Child")
+        sess = fixture_session()
+
+        # parent 1 has three children; only_child is uselist=False, so this
+        # is the >1 row case.
+        with testing.expect_warnings(
+            "Multiple rows returned with uselist=False for "
+            "eagerly-loaded attribute"
+        ):
+            p = (
+                sess.query(Parent)
+                .filter(Parent.id == 1)
+                .options(selectinload(Parent.only_child))
+                .one()
+            )
+            # first row by sort_key is child 11
+            eq_(p.only_child, Child(id=11))
+
+    def test_empty_collection_present(self):
+        """Parents with empty collections get an empty list set, not a
+        missing/unloaded attribute.
+
+        """
+        Parent = self.classes.Parent
+        sess = fixture_session()
+
+        p = (
+            sess.query(Parent)
+            .filter(Parent.id == 2)
+            .options(selectinload(Parent.children))
+            .one()
+        )
+        # attribute is present in __dict__ (committed) and equals []
+        eq_(p.__dict__["children"], [])
+
+    def test_m2m_grouping(self):
+        """many-to-many selectinload grouping, including an empty set and
+        tags shared / interleaved across parents.
+
+        """
+        M2MParent, Tag = self.classes("M2MParent", "Tag")
+        sess = fixture_session()
+
+        def go():
+            result = (
+                sess.query(M2MParent)
+                .options(selectinload(M2MParent.tags))
+                .order_by(M2MParent.id)
+                .all()
+            )
+            eq_(
+                {p.id: [t.id for t in p.tags] for p in result},
+                # m1 -> tags 1(sk50),3(sk30) ordered by sort_key -> [3, 1]
+                # m3 -> tags 2(sk40),4(sk20) ordered by sort_key -> [4, 2]
+                {1: [3, 1], 2: [], 3: [4, 2]},
+            )
+
+        self.assert_sql_count(testing.db, go, 2)
+
+    def test_m2o_basic_and_none_states(self):
+        """_load_via_child (many-to-one) basic correctness plus the
+        none_states branch (NULL FK -> related is None).
+
+        """
+        Item, Owner = self.classes("Item", "Owner")
+        sess = fixture_session()
+
+        def go():
+            result = (
+                sess.query(Item)
+                .options(selectinload(Item.owner))
+                .order_by(Item.id)
+                .all()
+            )
+            eq_(
+                [
+                    (i.id, i.owner.id if i.owner is not None else None)
+                    for i in result
+                ],
+                [(1, 1), (2, 1), (3, 2), (4, None)],
+            )
+            # the NULL-FK item's owner is committed as None, not unloaded
+            eq_(result[3].__dict__["owner"], None)
+
+        self.assert_sql_count(testing.db, go, 2)
+
+    def test_m2o_all_none(self):
+        """When every parent in the chunk has a NULL FK, the none_states
+        branch handles them all.
+
+        """
+        Item, Owner = self.classes("Item", "Owner")
+        sess = fixture_session()
+
+        def go():
+            result = (
+                sess.query(Item)
+                .filter(Item.id == 4)
+                .options(selectinload(Item.owner))
+                .all()
+            )
+            is_(result[0].owner, None)
+
+        # only the parent query; no IN(...) emitted since no non-null FKs
+        self.assert_sql_count(testing.db, go, 1)
+
+    def test_polymorphic_selectin_self_key(self):
+        """Polymorphic hierarchy: an Engineer and a Manager each have a
+        DIFFERENT selectin relationship.  This exercises that
+        ``state.get_impl(self_key)`` is still resolved per state after the
+        ``self.key`` hoist — each subclass instance must get its own
+        related objects via its own attribute.
+
+        """
+        Employee, Engineer, Manager, Machine, Report = self.classes(
+            "Employee", "Engineer", "Manager", "Machine", "Report"
+        )
+        sess = fixture_session()
+
+        def go():
+            result = (
+                sess.query(Employee)
+                .options(
+                    selectinload(Engineer.machines),
+                    selectinload(Manager.reports),
+                )
+                .order_by(Employee.id)
+                .all()
+            )
+            eng, mgr = result
+            assert isinstance(eng, Engineer)
+            assert isinstance(mgr, Manager)
+            # ordered by sort_key: machine 2 (sk1) then 1 (sk2)
+            eq_([m.id for m in eng.machines], [2, 1])
+            # ordered by sort_key: report 2 (sk1) then 1 (sk2)
+            eq_([r.id for r in mgr.reports], [2, 1])
+
+        # 1 parent query + 1 selectin per polymorphic relationship = 3
+        self.assert_sql_count(testing.db, go, 3)
